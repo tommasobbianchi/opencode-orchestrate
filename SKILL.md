@@ -1,157 +1,153 @@
 ---
 name: opencode-orchestrate
-description: Orchestrazione del codice a consumo ridotto di token — Claude fa da planner, orchestrator e reviewer, mentre delega l'esecuzione agentica (lettura/scrittura file, edit, test) a opencode CLI (DeepSeek V4) invocato non-interattivamente. Use when the user wants to save Claude tokens on coding tasks, offload implementation work, or says any of "delega a opencode", "fai fare a opencode", "usa opencode per", "/opencode", "orchestrazione opencode", "offload to opencode", "risparmia token", "modalita` orchestratore", "planner orchestrator reviewer", "execution su opencode". Use proactively for implementation-heavy tasks (bulk edits, scaffolding, refactor meccanici, test-writing, feature ben specificate) dove il grosso del costo token sarebbe leggere e riscrivere file.
+description: Token-frugal coding — the assistant plans, orchestrates and reviews while an executor CLI (opencode, DeepSeek) does the file reading, editing and test running. Use when the user wants to save tokens on implementation work, offload coding to a cheaper model, or says any of "offload to opencode", "delegate this", "use opencode for", "/opencode", "orchestrator mode", "planner orchestrator reviewer", "delega a opencode", "fai fare a opencode", "risparmia token". Use proactively for implementation-heavy tasks (bulk edits, scaffolding, mechanical refactors, test writing, well-specified features) where most of the token cost would be reading and rewriting files.
+license: MIT
+metadata:
+  version: 2.0.0
+  author: tommaso
+  domains: [delegation, code-review, cost-control, agent-orchestration]
 ---
 
-# /opencode-orchestrate — Claude pianifica e revisiona, opencode esegue
+# opencode-orchestrate — you plan and review, the executor types
 
-## Ruoli
+## Roles
 
-| Ruolo | Chi | Cosa fa | Cosa NON fa |
+| Role | Who | Does | Does NOT |
 |---|---|---|---|
-| **Planner** | Claude | Decompone il task, scrive spec precise | Non legge i file che opencode modifichera` |
-| **Orchestrator** | Claude | Lancia opencode via `oc_run.sh`, gestisce iterazioni | Non scrive codice direttamente |
-| **Executor** | opencode (DeepSeek V4) | Legge i file, edita, scrive, esegue i test | Non decide architettura, non fa git push |
-| **Reviewer** | Claude | Revisiona via `git diff`, verifica exit code dei test | Non rilegge interi file |
+| **Planner** | you | decomposes the task, writes precise specs | read the files the executor will modify |
+| **Orchestrator** | you | launches the executor, manages iterations | write code directly |
+| **Executor** | opencode (DeepSeek) | reads files, edits, writes, runs the tests | decide architecture, or touch git |
+| **Reviewer** | you | reviews by `git diff`, trusts the test exit code | re-read whole files |
 
-**Obiettivo: minimizzare i token consumati da Claude.** Ogni byte di codice che
-Claude legge o scrive e` un costo evitabile: il codice lo tocca opencode.
+**The goal is to minimise the tokens you spend.** Every byte of code you read or write is
+an avoidable cost — the executor is what touches the code.
 
-## Pre-flight (sempre, prima di delegare)
+## Pre-flight, every time
 
 ```bash
-OC=~/.npm-global/bin/opencode          # SOLO il build npm: lo snap fallisce
-$OC --version                          # sotto shell systemd-hardened (snap-confine)
-$OC providers 2>&1 | head -5           # auth DeepSeek presente?
+OC=~/.npm-global/bin/opencode          # the npm build; a confined snap install fails
+$OC --version                          # under a hardened shell
+$OC providers 2>&1 | head -5           # is auth present?
 cd <REPO> && git rev-parse HEAD && git status --porcelain | head
 ```
 
-- **Auth assente** → STOP, chiedi all'utente: `opencode auth login` (deepseek) oppure
-  esporta `DEEPSEEK_API_KEY`. Non proseguire alla cieca.
-- **Tree sporco** → segnalalo all'utente prima di delegare; annota sempre l'HEAD
-  di partenza per il rollback.
-- opencode eredita config da `~/.config/opencode/opencode.jsonc` (permessi
-  auto-allow, snapshot attivi, istruzioni da `~/.claude/CLAUDE.md` e
-  `~/MASTER_CONTEXT.md`): i worker partono gia` contestualizzati.
+- **No auth** → STOP and ask. Do not proceed blind.
+- **Dirty tree** → say so before delegating, and record the starting HEAD for rollback.
+- The executor inherits its own config and instruction files, so workers start with context
+  you did not have to pay for.
 
-## Protocollo
+## Protocol
 
-### 1 — PLAN (Claude, token-frugale)
+### 1 — PLAN (frugally)
 
-Costruisci il quadro SENZA leggere i sorgenti per intero:
-- `tree -L 2` / `ls`, `grep -rln <simbolo>`, GitNexus per la mappa del codice.
-- Leggi al massimo firme/interfacce (`grep -n "def \|class \|fn " file | head`).
+Build the picture WITHOUT reading sources in full: `tree -L 2`, `grep -rln <symbol>`, a code
+map if you have one. Read signatures and interfaces at most.
 
-Scrivi la spec in un prompt file (`/tmp/oc-task-N.md`). Ogni spec DEVE contenere:
-- **Path esatti** dei file da creare/modificare.
-- **Simboli esatti** (funzioni, classi) da introdurre o cambiare.
-- **Criteri di accettazione concreti** (comportamento osservabile).
-- **Comando di verifica** che opencode deve eseguire da solo
-  (es. `pytest tests/ -x -q`, `cargo build`, `npm test`) e l'obbligo di
-  iterare finche' non passa.
-- **Limiti**: "non toccare file fuori da <scope>", "niente commit, niente push".
+Write the spec to a file. Every spec MUST carry:
 
-### 2 — DELEGATE (Claude → opencode)
+- **exact paths** that may be created or modified
+- **exact symbols** to introduce or change
+- **concrete acceptance criteria** — observable behaviour
+- the **verification command** the executor runs *itself*, and the instruction to iterate to green
+- **limits**: "touch nothing outside \<scope\>", "no commits, no pushes"
+
+### 2 — DELEGATE
 
 ```bash
-RUN=~/.claude/skills/opencode-orchestrate/scripts/oc_run.sh
-$RUN -d ~/projects/<repo> -t <titolo-task> -T 600 -p /tmp/oc-task-1.md
+RUN=<skill>/scripts/oc_run.sh
+$RUN -d ~/projects/<repo> -t <task-title> -T 600 -p /tmp/oc-task-1.md
 ```
 
-**Scelta del modello (`-m`).** Di default opencode usa `deepseek-v4-pro`
-(da `opencode.jsonc`). Come orchestratore, in fase di PLAN sai gia` se il task
-e` meccanico o complesso: instrada di conseguenza.
-- `-m deepseek/deepseek-v4-flash` → task su singolo file, scaffolding, edit
-  meccanici, test-writing su spec chiara. ~68% piu` economico, ~invisibile il
-  gap di coding (SWE-bench 79.0 vs 80.6), piu` veloce.
-- `-m deepseek/deepseek-v4-pro` (o ometti il flag) → refactor multi-file,
-  invarianti cross-file, catene agentiche lunghe (Terminal-Bench: gap di 11
-  punti a favore di Pro), qualunque task dove un errore costa un ciclo ITERATE.
-- Nel dubbio, o se il primo giro Flash fallisce la REVIEW: ridelega a Pro.
+**Model choice (`-m`).** At PLAN time you already know whether the task is mechanical or
+subtle, so route it:
 
-- Il wrapper restituisce exit code, path del log e tail compatto (≤60 righe,
-  niente ANSI). **Leggi solo quello.** Il log completo e` su disco per i casi
-  dubbi — non rileggerlo se il tail basta.
-- Task seriali nello stesso repo: le correzioni continuano l'ultima sessione
-  con `-c` (mantiene il contesto lato opencode, costo zero lato Claude).
-- **Task paralleli: NON esistono. Un worker alla volta, punto** (snaporca-i14).
-  La regola precedente — "paralleli OK su worktree distinti" — era SBAGLIATA e ha
-  prodotto un fallimento silenzioso: di tre run concorrenti su tre worktree con `-d`
-  distinti, uno solo ha lavorato, gli altri due sono usciti con exit 0 senza toccare
-  nulla, e il log di un worker conteneva la trascrizione COMPLETA di un altro. Lo
-  stato condiviso sospetto è il session store sotto `~/.local/share/opencode`, che
-  un `-d` distinto non isola. `oc_run.sh` ora ha un flock per-utente e rifiuta il
-  secondo run con exit 3; il parallelismo va nella fase di PLANNING (subagent
-  Claude), mai nell'esecuzione.
-- **Exit 0 non prova che sia successo qualcosa.** I due worker affamati sono usciti
-  0 con diff vuoto. Il wrapper ora avvisa quando il working tree è pulito a fine
-  run; se compare quel WARNING, leggi il tail prima di credere che il task sia
-  fatto.
-- Task seriali nello stesso repo: le correzioni continuano l'ultima sessione con
-  `-c`; con sessioni multiple usa `-s <sessionID>` per riprenderne una precisa.
+- a **cheap/fast** model for single-file work, scaffolding, mechanical edits, test writing
+  against a clear spec — much cheaper, and the coding gap is near-invisible;
+- a **strong** model for multi-file refactors, cross-file invariants and long agentic chains,
+  where one mistake costs a whole ITERATE cycle;
+- when unsure, or when the cheap run fails REVIEW: re-delegate to the strong one.
 
-### 3 — REVIEW (Claude, a diff, mai a file interi)
+Operational rules:
+
+- The wrapper returns an exit code, a log path and a compact tail. **Read only the tail.**
+  The full log is on disk for the doubtful cases.
+- **There is no parallelism. One worker at a time.** An earlier version of this skill said
+  parallel runs were fine on distinct worktrees. That was WRONG and produced a silent
+  failure: of three concurrent runs with distinct `-d`, one did all the work, two exited 0
+  having changed nothing, and one worker's log contained another worker's complete
+  transcript. The suspected shared state is the executor's session store, which a distinct
+  working directory does not isolate. `oc_run.sh` now takes a per-user lock and refuses a
+  second run with exit 3. Parallelism belongs in PLANNING, never in execution.
+- **Exit 0 is not evidence that anything happened.** Both starved workers exited 0 with an
+  empty diff. The wrapper now warns when the target tree is clean after a run; if you see
+  that warning, read the tail before believing the task is done.
+- Serial tasks in the same repo: continue the last session with `-c`; with several sessions
+  use `-s <sessionID>` to resume a specific one.
+
+### 3 — REVIEW, by diff, never by whole files
 
 ```bash
-cd <repo>
-git diff --stat                  # prima la forma: file e volumi
-git diff -- <file-sospetto>      # poi il merito, solo dove serve
-<comando test>; echo "RC=$?"     # fidati dell'exit code, non rileggere i test
+git diff --stat                  # shape first: which files, how much
+git diff -- <suspect-file>       # merit second, only where it matters
+<test command>; echo "RC=$?"     # trust the exit code, don't re-read the tests
 ```
 
-Checklist: scope rispettato? file fuori spec toccati? simboli richiesti
-presenti (`grep -n`)? test verdi? niente segreti/credenziali nel diff?
+Checklist: scope respected? files outside the spec touched? required symbols present
+(`grep -n`)? tests green? no secrets in the diff?
 
-### 4 — ITERATE (max 3 cicli)
+And read deviations before rejecting them. An executor that says *"I did X instead, here is
+the measurement that shows why"* has just caught an error in your spec — which is the single
+most valuable thing it can do.
 
-Review fallita → prompt correttivo MINIMO (solo cosa e` sbagliato e cosa ci si
-aspetta, niente ripetizione della spec):
+### 4 — ITERATE (3 cycles maximum)
+
+A failed review gets a MINIMAL corrective prompt — what is wrong and what is expected, never
+a restatement of the spec:
 
 ```bash
-echo "Il test X fallisce con <errore>. Correggi SOLO <file>: <aspettativa>." | \
-  $RUN -d ~/projects/<repo> -c -t <titolo-task>-fix
+echo "Test X fails with <error>. Fix ONLY <file>: <expectation>." | \
+  $RUN -d ~/projects/<repo> -c -t <task-title>-fix
 ```
 
-Dopo 3 cicli falliti → STOP. Riporta all'utente diff parziale, errore e opzioni
-(intervento diretto di Claude, rollback, o respec). Non bruciare token in loop.
+After 3 failed cycles → STOP. Report the partial diff, the error and the options. Do not
+burn tokens in a loop.
 
 ### 5 — REPORT
 
-- Sintesi: cosa e` cambiato (`git diff --stat`), esito test, n. iterazioni.
-- Costo executor: `$OC stats | head -20` (token/costo DeepSeek lato opencode).
-- Rollback disponibile: `git reset --hard <HEAD-annotato>` (solo su conferma utente).
+Summary of what changed (`git diff --stat`), test outcome, iteration count, executor cost,
+and the rollback command against the HEAD you recorded — to be run only on explicit
+confirmation.
 
-## Regole dure di economia token (per Claude)
+## Hard rules of token economy
 
-1. MAI leggere per intero un file che opencode creera` o modifichera`.
-2. Review SEMPRE a diff: `--stat` prima, diff mirato poi.
-3. La verifica dei test la esegue opencode; Claude controlla solo l'exit code.
-4. Correzioni via `-c` (sessione calda), mai ri-spec da zero.
-5. Output di opencode: solo il tail del wrapper; il log integrale resta su disco.
-6. Spec chirurgiche e brevi: path + simboli + accettazione, niente prosa.
+1. NEVER read in full a file the executor will create or modify.
+2. Review ALWAYS by diff: `--stat` first, targeted diff after.
+3. The executor runs the tests; you check the exit code.
+4. Corrections via `-c` on the warm session, never a fresh spec.
+5. Executor output: the wrapper tail only.
+6. Specs surgical and short: paths, symbols, acceptance. No prose.
 
-## Cosa NON delegare
+## What NOT to delegate
 
-- Decisioni architetturali, refactor ambigui con invarianti cross-file, security review → restano a Claude.
-- Operazioni irreversibili (push, deploy, migrazioni, `rm -rf`, modifiche a servizi systemd) → Claude + conferma esplicita dell'utente.
-- Task che richiedono i tool MCP della sessione Claude (FreeCAD, chrome-devtools, SauronsEye).
-- Micro-task: se la risposta sta in 30 secondi di Claude, l'overhead di delega non ripaga.
+- Architectural decisions, ambiguous refactors with cross-file invariants, security review.
+- Irreversible operations — push, deploy, migrations, `rm -rf`, service changes. Those stay
+  with you, and need explicit user confirmation.
+- Anything requiring tools only your session has.
+- Micro-tasks: if you could do it in 30 seconds, the delegation overhead does not repay.
 
 ## Troubleshooting
 
-| Sintomo | Causa | Fix |
+| Symptom | Cause | Fix |
 |---|---|---|
-| `snap-confine ... cap_dac_override` | invocato lo snap da shell systemd-hardened | usa `~/.npm-global/bin/opencode` (gia` default del wrapper) |
-| `Unauthorized: Authentication Fails` | manca credenziale DeepSeek | `opencode auth login` o `DEEPSEEK_API_KEY` nell'env |
-| exit 124 dal wrapper | timeout | alza `-T`, o spezza il task in spec piu` piccole |
-| worker tocca file fuori scope | spec troppo vaga | respec con limiti espliciti, rollback mirato del file |
+| sandbox/confinement error on launch | a confined snap install invoked from a hardened shell | use the npm build (the wrapper's default) |
+| `Unauthorized: Authentication Fails` | missing executor credential | `opencode auth login`, or set the API key in the environment |
+| exit 124 from the wrapper | timeout | raise `-T`, or split the task into smaller specs |
+| exit 3 from the wrapper | another run holds the lock | wait; runs are deliberately serial (see DELEGATE) |
+| worker touched files outside scope | spec too vague | re-spec with explicit limits, roll back that file |
 
-## Report automatico costi (Athena/Telegram)
+## Cost reporting
 
-Ogni sera alle 21:30 il timer `oc-stats-report.timer` (systemd user) esegue
-`scripts/oc_stats_report.sh 1`: estrae `opencode stats --days 1` e invia un
-riepilogo compatto (sessioni, costo $, token in/out, cache) via
-`athena/modules/comm-tg/outbound.py` — categoria `system_update`, quindi
-passa dal budget arbiter come ogni altro messaggio. Zero sessioni nella
-finestra → nessun messaggio. Test manuale senza invio:
-`oc_stats_report.sh 1 --dry-run`.
+`opencode stats --days 1` gives sessions, cost and token counts for the window.
+`scripts/oc_stats_report.sh 1` formats it compactly and `--dry-run` prints without sending,
+so it can be wired to whatever notification path you already have — a cron job, a chat
+webhook, or nothing at all.
