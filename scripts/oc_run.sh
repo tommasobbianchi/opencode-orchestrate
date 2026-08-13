@@ -55,6 +55,26 @@ TS=$(date +%Y%m%d-%H%M%S)
 SAFE_TITLE=$(printf '%s' "$TITLE" | tr -cs 'a-zA-Z0-9_-' '-')
 LOG="$LOGDIR/$TS-$SAFE_TITLE.log"
 
+# ONE WORKER AT A TIME, PER USER (snaporca-i14). Concurrent opencode runs on this box do not
+# merely contend — they CROSS-ATTRIBUTE: of three parallel runs, one did all the work, two
+# exited 0 having changed nothing, and one worker's log contained another worker's complete
+# transcript. An orchestrator that follows the skill's own token-economy rule (read the tail,
+# trust it) would then review a diff belonging to a different task, or mark work done that
+# never happened. The lock is per-USER and not per-repo on purpose: the suspected shared state
+# is the opencode session store under ~/.local/share/opencode, which distinct -d does not
+# isolate. Refuse rather than queue — a caller that blocks for 30 minutes with no output looks
+# identical to a hang, and the orchestrator needs to know it must serialise.
+LOCK="$LOGDIR/.run.lock"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "ERR: another opencode run is already in progress (lock: $LOCK)."
+  echo "     Concurrent runs cross-attribute their output and silently no-op — snaporca-i14."
+  echo "     Wait for it to finish, then re-run. Set OC_ALLOW_CONCURRENT=1 only to reproduce"
+  echo "     the bug deliberately."
+  [ "${OC_ALLOW_CONCURRENT:-0}" = "1" ] || exit 3
+  echo "     OC_ALLOW_CONCURRENT=1 set — proceeding anyway, results are NOT trustworthy."
+fi
+
 # opencode 1.17.x HANGS when stdout is not a TTY (produces zero output, then
 # times out). Provide a pseudo-TTY via script(1) so non-interactive runs work.
 # Prompt is passed via a temp file to survive multi-line/special chars.
@@ -70,6 +90,17 @@ rm -f "$PF"
 
 echo "EXIT_CODE: $RC $( [ $RC -eq 124 ] && echo '(TIMEOUT)' )"
 echo "LOG: $LOG ($(wc -l <"$LOG") righe)"
+# Exit 0 is not evidence that anything happened (snaporca-i14): the two starved workers both
+# exited 0 with an empty diff. Say so here, where the orchestrator is already looking, rather
+# than leaving it to be noticed three steps later during review.
+if git -C "$WORKDIR" rev-parse --git-dir >/dev/null 2>&1; then
+  if [ -z "$(git -C "$WORKDIR" status --porcelain)" ]; then
+    echo "WARNING: exit $RC but the working tree is CLEAN — this run changed nothing."
+    echo "         Read the tail before believing the task was done; a task that legitimately"
+    echo "         only reads or reports will also land here, so this is a prompt to check,"
+    echo "         not a verdict."
+  fi
+fi
 echo "--- TAIL ---"
 sed -e 's/\x1b\[[0-9;]*[mK]//g' -e 's/\x1b\][^\x07]*\x07//g' "$LOG" | grep -v '^\s*$' | tail -60
 exit $RC

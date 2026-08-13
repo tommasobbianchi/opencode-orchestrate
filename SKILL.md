@@ -74,9 +74,21 @@ e` meccanico o complesso: instrada di conseguenza.
   dubbi — non rileggerlo se il tail basta.
 - Task seriali nello stesso repo: le correzioni continuano l'ultima sessione
   con `-c` (mantiene il contesto lato opencode, costo zero lato Claude).
-- Task paralleli: SOLO su repo/worktree distinti (`git worktree add`), un
-  `oc_run.sh` per directory, mai due worker sugli stessi file. Con worker
-  paralleli non usare `-c` (ambiguo): usa `-s <sessionID>` se serve riprendere.
+- **Task paralleli: NON esistono. Un worker alla volta, punto** (snaporca-i14).
+  La regola precedente — "paralleli OK su worktree distinti" — era SBAGLIATA e ha
+  prodotto un fallimento silenzioso: di tre run concorrenti su tre worktree con `-d`
+  distinti, uno solo ha lavorato, gli altri due sono usciti con exit 0 senza toccare
+  nulla, e il log di un worker conteneva la trascrizione COMPLETA di un altro. Lo
+  stato condiviso sospetto è il session store sotto `~/.local/share/opencode`, che
+  un `-d` distinto non isola. `oc_run.sh` ora ha un flock per-utente e rifiuta il
+  secondo run con exit 3; il parallelismo va nella fase di PLANNING (subagent
+  Claude), mai nell'esecuzione.
+- **Exit 0 non prova che sia successo qualcosa.** I due worker affamati sono usciti
+  0 con diff vuoto. Il wrapper ora avvisa quando il working tree è pulito a fine
+  run; se compare quel WARNING, leggi il tail prima di credere che il task sia
+  fatto.
+- Task seriali nello stesso repo: le correzioni continuano l'ultima sessione con
+  `-c`; con sessioni multiple usa `-s <sessionID>` per riprenderne una precisa.
 
 ### 3 — REVIEW (Claude, a diff, mai a file interi)
 
